@@ -1,0 +1,415 @@
+diff --git a/docs/UNCENSORED_Q8.md b/docs/UNCENSORED_Q8.md
+index d1c02578..623ab5e8 100644
+--- a/docs/UNCENSORED_Q8.md
++++ b/docs/UNCENSORED_Q8.md
+@@ -9,7 +9,7 @@ walk). Validated on 4x RTX 3090 (sm_86) + 256 GB DDR4, Linux, CUDA 12.4, engine
+ > **On this page:** [What is in the file](#what-is-in-the-file) · [The pack](#the-pack-by-hand) ·
+ > [The server](#the-server) · [Speed](#what-to-expect) · [Quality](#quality) ·
+ > [What the engine did not have](#what-the-engine-did-not-have-and-has-now) ·
+-> [Known issues](#known-issues)
++> [Keeping these changes](#keeping-these-changes) · [Known issues](#known-issues)
+ 
+ ## What is in the file
+ 
+@@ -197,6 +197,29 @@ Files with an integrated MTP draft block (`qwen4exp.nextn_predict_layers = 1`,
+   `served_names` skip the draft blocks (`draft_cut`/`is_draft` from the shards'
+   own metadata), keeping the three walks in step. Geometry stays 48 everywhere.
+ 
++## Keeping these changes
++
++The three fixes above (and `tools/mtp_from_gguf.py`) are in this tree, not in
++upstream Strata. They are kept as patches in `local/` - `local/README.md` has the
++whole story:
++
++| Patch | Change |
++| --- | --- |
++| `local/uncensored-q8-mtp.patch` | the packer, the arch guard, the dense walk, `tools/mtp_from_gguf.py`, this file |
++| `local/arena-prepop.patch` | the startup fix (the engine fills its host arena itself before the CUDA driver pins it) |
++| `local/persistence.patch` | the setup's warning for a new copy of Strata, and the files in `local/` |
++
++The engine that runs is the one built from this tree: `engine/BUILD.json` says
++`"source": "local"`, so `setup.py` never downloads the published engine over it,
++and compiles it again only when `src/` or `include/` changed
++(`local/install-local-engine.py` writes that file, `local/build-local-engine.sh`
++compiles and installs it).
++
++A new copy of Strata - a new release unzipped elsewhere - sets itself up like
++this install but compiles the upstream source, which has none of these fixes: it
++says so and names the patches to apply to it first. Copies of the patches are in
++`/home/chota/lmstudio/strata-local-backup/`.
++
+ ## Known issues
+ 
+ - `STRATA_STAGE_TRIM=1` on this 4-way native-Q8 split: the engine dies silently
+diff --git a/local/README.md b/local/README.md
+new file mode 100644
+index 00000000..ddf01e72
+--- /dev/null
++++ b/local/README.md
+@@ -0,0 +1,64 @@
++# The local changes to Strata, and how to keep them
++
++This folder holds the changes this copy of Strata has on top of the upstream release it was downloaded from
++([github.com/Niko1221/Strata](https://github.com/Niko1221/Strata), version 0.1.43, upstream commit
++`7695859a` of 2026-10-11), and the two tools that keep them.
++
++Two sets of changes are here, plus the tools that keep them:
++
++| Patch | What it changes | Why |
++| --- | --- | --- |
++| `uncensored-q8-mtp.patch` | `tools/iq_pack.py`, `include/strata/artifact/gguf_reader.hpp`, `src/core/native_dense.cpp` (changed), `tools/mtp_from_gguf.py` (new), `docs/UNCENSORED_Q8.md` (new) | the MTP awareness that lets the Qwen3.8-Flash-Next Uncensored Q8_0 pack run (see `docs/UNCENSORED_Q8.md`) |
++| `arena-prepop.patch` | `src/core/pinned.cu`, `include/strata/core/pinned.hpp`, `tests/core/arena_populate_test.cpp` (new), `CMakeLists.txt`, `docs/DETAILS.md`, `docs/TROUBLESHOOTING.md` | the startup fix: the engine fills its host arena itself, in parallel, before the CUDA driver pins it (measured 455 s -> 23.7 s for the fill on this PC) |
++| `persistence.patch` | `setup.py`, `docs/UNCENSORED_Q8.md` (the section below), `tools/test_setup_local_changes.py` (new), `local/README.md`, `local/install-local-engine.py`, `local/build-local-engine.sh` | this folder: the engine stays the one built from these sources, and a new copy of Strata says which patches it has to apply before it compiles the upstream source |
++
++All three patches apply to a fresh upstream copy of commit `7695859a` with `git apply`, in that order (the second
++one on top of the first, the third on top of both). They were checked that way: a fresh checkout of `7695859a`
++plus the three patches is byte-identical to this tree's changed files.
++
++## The engine stays the one built from these sources
++
++`setup.py` normally downloads a ready-made engine and replaces the installed one when it is older than the
++published one. That would drop the changes above. Three files in `setup.py` make the engine in `engine/` the one
++that is built here:
++
++- `engine/BUILD.json` has `"source": "local"` - `get_prebuilt()` returns `None` for it (`setup.py:2973`), so
++  nothing is downloaded;
++- the same file's `"src"` is the hash of these sources (`source_hash(ENGINE_SOURCES)`), so
++  `update_installed_engine()` (`setup.py:3127`) compiles the engine again only when `src/`, `include/` or
++  `CMakeLists.txt` changed - and compiles it from here, not downloads it;
++- `build_engine()` (`setup.py:3402`) then finds the engine up to date and starts it as it is.
++
++`local/install-local-engine.py` writes that file, in setup.py's own format and with setup.py's own hash, so the
++two always agree. It also copies the compiled engine to `engine/strata` and points the model's config at it.
++
++**After every change in `src/` or `include/`:**
++
++    local/build-local-engine.sh          # compile (incremental) and install
++
++Then `./setup.sh` starts the new engine. Without the install, the next setup run would notice the changed source
++and compile the engine itself (same result, but 10-20 minutes instead of a few).
++
++## When a newer Strata comes out
++
++This copy was not made with git, so `./update.sh` cannot fetch anything into it. To take the new upstream code
++and keep these changes:
++
++    git clone https://github.com/Niko1221/Strata.git new-strata
++    cd new-strata
++    git checkout 7695859a                  # the commit these patches were made against
++    git apply /path/to/strata-local-backup/uncensored-q8-mtp.patch
++    git apply /path/to/strata-local-backup/arena-prepop.patch
++    git apply /path/to/strata-local-backup/persistence.patch
++
++Then move the new upstream code in: the patches touch `src/`, `include/`, `tools/`, `tests/`, `setup.py` and
++`docs/`, so `git merge` of the new main into that branch shows the conflicts where upstream changed the same
++lines. The model files, the pack and the config are not in the repository and are not touched by this.
++
++## Copies of these files outside the repository
++
++A copy of the patches and of the changed files is in `/home/chota/lmstudio/strata-local-backup/` (outside this
++folder, so it survives a new copy of Strata unzipped next to it):
++
++- `uncensored-q8-mtp.patch`, `arena-prepop.patch`, `persistence.patch` - the three patches;
++- `files/` - the changed files themselves, and `tree-changes-2026-10-21.tar.gz` - the same as one archive.
+diff --git a/local/build-local-engine.sh b/local/build-local-engine.sh
+new file mode 100755
+index 00000000..26806c19
+--- /dev/null
++++ b/local/build-local-engine.sh
+@@ -0,0 +1,18 @@
++#!/bin/sh
++# Compile the engine from this source tree and install it as this PC's engine (engine/strata + engine/BUILD.json).
++#
++# After a change in src/ or include/, this is what makes the next ./setup.sh run use it: the engine in engine/ is
++# the one the model config points at, and its BUILD.json (written by local/install-local-engine.py) says it was
++# compiled here - so setup.py never downloads the published engine over it.
++#
++# The compile is incremental (cmake): only the changed files are rebuilt.
++set -e
++cd "$(dirname "$0")/.."
++BUILD_DIR="${BUILD_DIR:-build}"
++if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
++  echo "no build folder in $BUILD_DIR: configure it first (see docs/DETAILS.md for the cmake line)." >&2
++  exit 1
++fi
++echo "Compiling the engine in $BUILD_DIR ..."
++cmake --build "$BUILD_DIR" --target strata -j "$(nproc)"
++.venv/bin/python local/install-local-engine.py "$@"
+diff --git a/local/install-local-engine.py b/local/install-local-engine.py
+new file mode 100755
+index 00000000..8a128052
+--- /dev/null
++++ b/local/install-local-engine.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""Install the engine compiled from this source tree as this PC's engine (engine/strata + engine/BUILD.json).
++
++Why this file exists
++--------------------
++setup.py downloads a ready-made engine (the published one) whenever engine/ has no BUILD.json, and replaces the
++installed one when it is older than the published one.  A download would replace the engine built from THESE
++sources with the published binary - the local MTP / uncensored-Q8 patches (docs/UNCENSORED_Q8.md) would be gone.
++
++engine/BUILD.json with "source": "local" is how setup.py knows the engine in engine/ was compiled here:
++  - get_prebuilt() returns None for it (setup.py:2973) - nothing is downloaded, ever;
++  - update_installed_engine() (setup.py:3127) compiles it again only when the source of these files changed;
++  - build_engine() (setup.py:3402) then says "engine already built for this PC" and starts it as it is.
++So the engine that runs is always the one built from this tree, and a change in src/ or include/ is picked up by
++the next setup run (which compiles it again).
++
++What it does
++------------
++  1. copies the compiled engine (build/strata) to engine/strata;
++  2. writes engine/BUILD.json in setup.py's own format, with setup.py's own source hash (so the hashes always
++     agree with what setup.py compares against);
++  3. points the model's config at that engine (absolute paths), so it runs the same engine from any folder.
++
++Use it after every compile:
++    .venv/bin/python local/install-local-engine.py
++or compile and install in one step:
++    local/build-local-engine.sh
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++import setup  # noqa: E402  (the canonical owner of the engine bookkeeping)
++
++BUILT = ROOT / "build" / setup.EXE
++ENG = setup.engine_dir(13)
++CONFIGS = sorted(ROOT.glob("strata-*.json"))
++
++
++def cuda_lib_dirs() -> list[str]:
++    """Where the CUDA runtime the engine loads lives (the 'cuda_dirs' of setup.py's BUILD.json)."""
++    out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
++    dirs: list[str] = []
++    for line in out.splitlines():
++        if "=>" not in line:
++            continue
++        if "libcudart.so" not in line and "libcublas.so" not in line:
++            continue
++        path = line.split("=>")[-1].strip().split(" (")[0]
++        folder = str(Path(path).parent)
++        if folder not in dirs:
++            dirs.append(folder)
++    return dirs or setup.cuda_lib_dirs(13)
++
++
++def archs_of(cfg: dict) -> list[int]:
++    """The compute capabilities the engine needs code for: the cards the model runs on."""
++    archs: set[int] = set()
++    cards = cfg.get("gpu")
++    cards = cards if isinstance(cards, list) else [cards]
++    for index in cards:
++        if index is None:
++            continue
++        info = setup.gpu_info(int(index))
++        if info:
++            archs.add(int(info["arch"]))
++    return sorted(archs)
++
++
++def install(cfg_paths: list[Path]) -> dict:
++    if not BUILT.exists():
++        sys.exit(f"no compiled engine at {BUILT}: compile it first (local/build-local-engine.sh)")
++    ENG.mkdir(exist_ok=True)
++    # the copy is written next to it and moved over the old one: a running engine is never half replaced
++    tmp = ENG / (setup.EXE + ".new")
++    shutil.copy2(BUILT, tmp)
++    os.replace(tmp, ENG / setup.EXE)
++
++    meta = {
++        "source": "local",
++        "version": setup.source_version(),
++        "archs": [],
++        "vision": "none",
++        "cuda_dirs": cuda_lib_dirs(),
++        "src": setup.source_hash(setup.ENGINE_SOURCES),
++        "vision_src": setup.source_hash(setup.VISION_SOURCES),
++    }
++    floor = setup.cpu_floor(setup.cpu_info()[1])
++    if floor:
++        meta["isa_floor"] = floor
++
++    all_archs: set[int] = set()
++    for path in cfg_paths:
++        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
++        all_archs |= set(archs_of(cfg))
++        if cfg.get("vision"):
++            meta["vision"] = "gpu" if (ENG / setup.VEXE).exists() else "cpu"
++    if all_archs:
++        meta["archs"] = sorted(all_archs)
++    (ENG / "BUILD.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
++    return meta
++
++
++def point_configs_at(cfg_paths: list[Path]) -> None:
++    """The config runs the installed engine, from any folder (absolute paths)."""
++    for path in cfg_paths:
++        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
++        cfg["exe"] = str(ENG / setup.EXE)
++        cfg["cwd"] = str(ROOT)
++        if cfg.get("vision") and (ENG / setup.VEXE).exists():
++            cfg["vision"]["exe"] = str(ENG / setup.VEXE)
++        setup.write_config(path, cfg)
++
++
++def main() -> int:
++    args = [a for a in sys.argv[1:] if not a.startswith("-")]
++    cfg_paths = [Path(a) for a in args] or CONFIGS
++    cfg_paths = [p for p in cfg_paths if p.exists()]
++    if not cfg_paths:
++        print("no model config found (strata-*.json); the engine is installed anyway")
++    meta = install(cfg_paths)
++    point_configs_at(cfg_paths)
++    print(f"engine installed : {ENG / setup.EXE} (from {BUILT})")
++    print(f"BUILD.json       : {json.dumps(meta)}")
++    for path in cfg_paths:
++        print(f"config           : {path.name} -> {json.loads(path.read_text(encoding='utf-8-sig'))['exe']}")
++    # the checks setup.py itself makes, on the files just written
++    same = setup.source_hash(setup.ENGINE_SOURCES) == meta["src"]
++    print(f"setup.py sees    : source {'matches' if same else 'DIFFERS FROM'} the installed engine")
++    print(f"                   (a change in src/ or include/ makes the next setup run compile it again)")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/setup.py b/setup.py
+index 7dab3b82..2df06f31 100644
+--- a/setup.py
++++ b/setup.py
+@@ -4006,6 +4006,23 @@ def previous_config(elsewhere_first: list, settings: dict):
+     return next((c for c in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True) if readable_config(c)), None)
+ 
+ 
++def local_change_patches(folder: Path) -> list[Path]:
++    """The patches of a Strata folder with local changes (a local/ folder): the changes to the upstream source that
++    folder carries.  A new copy of Strata set up like such an install compiles the upstream source - these patches
++    have to be applied to it first, so the setup says so."""
++    d = Path(folder) / "local"
++    return sorted(d.glob("*.patch")) if d.is_dir() else []
++
++
++def warn_local_changes(folder: Path) -> None:
++    """Says which local changes a Strata folder has: a copy of it that compiles the upstream source (a new copy of
++    Strata, set up like that install) does not have them, and the model that needs them would not run."""
++    for patch in local_change_patches(folder):
++        warn(f"  The install in {folder} has local changes ({patch.name}): a copy of Strata set up like it compiles "
++             "the upstream source, so the engine it builds does not have them. Apply them to the copy first "
++             f"(git apply \"{patch}\"), then run setup again - local/README.md says how.")
++
++
+ def choices_from_config(cfg_path: Path) -> dict:
+     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
+     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+@@ -4932,6 +4949,10 @@ def main() -> int:
+             if ch["model"]:
+                 say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
+                     "copy the same way - the model files are reused, nothing big is downloaded.")
++                # a copy with local changes (a local/ folder): the earlier install was changed by hand, this copy's
++                # source is the upstream code - an engine compiled here would not have those changes, and the model
++                # that needs them would not run. Say so before the engine is compiled, not after.
++                warn_local_changes(prev.parent)
+                 a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
+                 adopted = prev
+                 a.kv = a.kv or ch["kv"]
+diff --git a/tools/test_setup_engine_hash.py b/tools/test_setup_engine_hash.py
+index 86c8b285..0574c347 100644
+--- a/tools/test_setup_engine_hash.py
++++ b/tools/test_setup_engine_hash.py
+@@ -294,7 +294,21 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
+     def setUp(self):
+         self.tmp = tempfile.TemporaryDirectory()
+         self.addCleanup(self.tmp.cleanup)
+-        (Path(self.tmp.name) / "engine").mkdir(parents=True, exist_ok=True)
++        self.eng = Path(self.tmp.name) / "engine"
++        self.eng.mkdir(parents=True, exist_ok=True)
++        # the engine folder of the test, not this PC's: an installed engine (engine/BUILD.json) says
++        # "compiled here" and get_prebuilt then returns at once, without the download these tests are about
++        patcher = mock.patch.object(setup, "engine_dir", return_value=self.eng)
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        # the HEAD probe for the published archive: it must answer, or the flow ends before the download
++        class Head:
++            def close(self):
++                pass
++
++        patcher = mock.patch.object(setup.urllib.request, "urlopen", lambda *a, **k: Head())
++        patcher.start()
++        self.addCleanup(patcher.stop)
+ 
+     def fake_download(self, url, dst, what=None):
+         with zipfile.ZipFile(dst, "w") as z:
+diff --git a/tools/test_setup_local_changes.py b/tools/test_setup_local_changes.py
+new file mode 100644
+index 00000000..551b29cd
+--- /dev/null
++++ b/tools/test_setup_local_changes.py
+@@ -0,0 +1,57 @@
++"""A Strata folder with local changes (a local/ folder with patches) keeps them: a new copy of Strata set up like
++that install says which patches it has to apply before it compiles the upstream source.
++
++    python -m unittest tools.test_setup_local_changes
++"""
++from __future__ import annotations
++
++import io
++import sys
++import tempfile
++import unittest
++from contextlib import redirect_stdout
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "tools"))
++import setup  # noqa: E402
++
++
++class LocalChanges(unittest.TestCase):
++    def setUp(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        self.folder = Path(tmp.name)
++
++    def test_the_patches_of_a_folder_are_found(self):
++        self.assertEqual(setup.local_change_patches(self.folder), [])
++        local = self.folder / "local"
++        local.mkdir()
++        (local / "uncensored-q8-mtp.patch").write_text("--- a\n+++ b\n", encoding="utf-8")
++        (local / "arena-prepop.patch").write_text("--- c\n+++ d\n", encoding="utf-8")
++        (local / "README.md").write_text("not a patch\n", encoding="utf-8")
++        self.assertEqual([p.name for p in setup.local_change_patches(self.folder)],
++                         ["arena-prepop.patch", "uncensored-q8-mtp.patch"])
++
++    def test_a_copy_set_up_like_it_is_told_about_the_patches(self):
++        local = self.folder / "local"
++        local.mkdir()
++        patch = local / "uncensored-q8-mtp.patch"
++        patch.write_text("--- a\n+++ b\n", encoding="utf-8")
++        out = io.StringIO()
++        with redirect_stdout(out):
++            setup.warn_local_changes(self.folder)
++        said = out.getvalue()
++        self.assertIn("uncensored-q8-mtp.patch", said)
++        self.assertIn("git apply", said)
++
++    def test_an_untouched_folder_says_nothing(self):
++        out = io.StringIO()
++        with redirect_stdout(out):
++            setup.warn_local_changes(self.folder)
++        self.assertEqual(out.getvalue(), "")
++
++
++if __name__ == "__main__":
++    unittest.main()

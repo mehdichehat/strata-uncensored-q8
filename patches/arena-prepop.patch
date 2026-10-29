@@ -1,0 +1,409 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index de94fcdd..48d0ad4d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -493,6 +493,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
+   endif()
+ 
++  # The expert arena's pages are made resident BEFORE cudaHostRegister pins them (the driver populates the range
++  # itself, on one thread, which took 455 s for the 119.53 GiB arena on a host whose page cache held the model).
++  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/arena_populate_test.cpp")
++    add_executable(arena_populate_test tests/core/arena_populate_test.cpp)
++    target_link_libraries(arena_populate_test PRIVATE strata_core)
++    add_test(NAME arena_populate_test COMMAND arena_populate_test)
++    set_tests_properties(arena_populate_test PROPERTIES TIMEOUT 120)
++  endif()
++
+   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
+     enable_testing()
+     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 49c49d1b..89c307dd 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -550,6 +550,20 @@ Terminal chat: `.venv/bin/python chat.py`.
+ - **WSL** works (Ubuntu 24.04 tested), with one limit: the NVIDIA driver pins only about 1 GB of RAM there, so KV
+   streaming (`--kv-resident`) is off and the KV cache stays in VRAM, and the experts are copied to the GPU from
+   unpinned RAM (slower prompts than native Linux).
++- **The expert arena is made resident before the driver pins it (Linux, on by default).** `cudaHostRegister`
++  does not only PIN the arena, it POPULATES it: one driver thread, one ioctl, and on a PC whose page cache holds the
++  model files that thread waits for the kernel's direct compaction for every 2 MiB page it faults in. Measured on one
++  PC (4x RTX 3090, 251 GiB of RAM, Linux 6.17, THP=madvise, defrag=madvise, the page cache holding 205 GiB of the model
++  files and 15 GiB free): the driver's own registration took **455 s** in a benchmark and about **800 s** inside the
++  engine, and the engine reported READY at **883 s** - 17 s inside the server's 900 s start budget; a busier start did
++  not make it and the server called the engine dead (the kernel counters during that registration: `compact_stall`
++  +95,755, `compact_fail` +82,816). The engine now faults the same pages in itself, on 16 threads, and the driver only
++  pins them: **24.8 s** for the population and about 6 s for the registration, the experts loaded at **122 s** and the
++  first answer came 168 s after the start. The pages are the same and the answers are the same; only WHO faults them in
++  changes. With the page cache cold (144 GiB free) the same arena registered in 4.2 s the driver's way and 2.4 s this way
++  (a 32 GiB arena: 4.15 s against 0.62 s + 1.75 s), so it is faster in both memory states. The startup line says which
++  way ran: `arena populated in 24.8 s on 16 threads before the registration`. `STRATA_NO_ARENA_PREPOP=1` puts the
++  driver's way back (the same-run A/B switch).
+ 
+ ---
+ 
+@@ -1798,6 +1812,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
+ | `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
+ | `ExpertCache: cudaMalloc(...) failed: out of memory` although VRAM is free | Windows' page file is off or tiny: every allocation on the graphics card is also charged to Windows' commit (RAM + page file). Set a fixed page file size, the same initial and maximum size (e.g. 65536 MB: System > About > Advanced system settings > Performance > Advanced > Virtual memory > Custom size), and restart: a page file Windows grows on demand ("System managed", or an initial size below the maximum) may not grow in time while the card's memory is charged (#60: "System managed" and 4096-32768 MB still failed, a fixed 64 GB worked). Since 0.1.19 the engine retries with a smaller cache instead of stopping, and setup warns about a page file under 4 GB (issue #60). |
+ | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
++| The start never finishes: "the engine did not report READY within 900 s" | The expert arena is page-locked in one go, and the driver populates it in one thread: on a PC whose page cache holds the model files, that thread waits for the kernel's memory compaction for every 2 MiB page, and the start runs past the server's 900 s budget. The engine now makes the pages resident itself, on 16 threads, and the driver only pins them (measured on a 4x RTX 3090 PC with 251 GiB of RAM and 205 GiB of the model cached: 455 s for the driver's registration alone, 123.5 s for the engine's own population and about 6 s to pin). The startup line says which way ran: `arena populated in 123.5 s on 16 threads before the registration`. `STRATA_NO_ARENA_PREPOP=1` puts the driver's way back. Freeing RAM (closing browsers) helps too: the compaction is the symptom of a full page cache. |
+ | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
+ | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer - usually out of RAM (Linux ends the biggest program: `sudo dmesg \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats: close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
+ | Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
+diff --git a/docs/TROUBLESHOOTING.md b/docs/TROUBLESHOOTING.md
+index 706f355d..0e1f5b62 100644
+--- a/docs/TROUBLESHOOTING.md
++++ b/docs/TROUBLESHOOTING.md
+@@ -66,6 +66,18 @@ PC); `STRATA_READ_AHEAD=0` turns that off. On Linux with transparent huge pages
+ for `MADV_HUGEPAGE` on top (a fragmented machine spent minutes compacting memory, #771); `STRATA_NO_ARENA_THP=1` skips
+ that request on any setting.
+ 
++**The start never finishes: "the engine did not report READY within 900 s" (Linux).**
++The expert arena (119.53 GiB on the uncensored Q8 pack) is page-locked by the driver, and the driver POPULATES it too:
++one driver thread, one ioctl. On a PC whose page cache holds the model files, that one thread waits for the kernel's
++direct compaction for every 2 MiB page, and the start takes longer than the server's 900 s budget - the server then
++says the engine died. Measured on one PC (4x RTX 3090, 251 GiB of RAM, the page cache holding 205 GiB of the model and
++15 GiB free): 455 s for the registration alone in a benchmark, about 800 s inside the engine, which then reported READY
++at 883 s - 17 s inside the budget; on a busier start it did not make it. The engine now makes the same pages resident
++itself, on 16 threads, and the driver only pins them (24.8 s, the experts loaded at 122 s, the first answer 168 s after
++the start); the startup line says which way ran: `arena populated in 24.8 s on 16 threads before the registration`.
++`STRATA_NO_ARENA_PREPOP=1` puts the driver's way back. Freeing RAM (closing browsers) helps too: the compaction is the
++symptom of a full page cache.
++
+ **Setup says the engine does not match GitHub's checksum.**
+ Setup checks the downloaded ready-made engine against the SHA-256 GitHub publishes. On a mismatch the file is corrupt or was changed on the way, so setup deletes it and stops; run setup again to download it afresh. If GitHub gives no checksum (offline, rate limited, your own mirror), setup warns and installs anyway. `STRATA_SKIP_SHA256=1` skips the check, only if you insist.
+ 
+diff --git a/include/strata/core/pinned.hpp b/include/strata/core/pinned.hpp
+index 51d0948f..899268e1 100644
+--- a/include/strata/core/pinned.hpp
++++ b/include/strata/core/pinned.hpp
+@@ -28,6 +28,26 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
+ /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
+ int arena_pin_cap_gib();
+ 
++/// What `populate_host_arena` did, for the startup print.
++struct ArenaPopulation {
++    double seconds = 0.0;             ///< wall clock of the population
++    int threads = 0;                  ///< threads that faulted the pages in
++    uint64_t bytes = 0;               ///< bytes made resident (0: nothing was done)
++    bool huge_pages_dropped = false;  ///< the huge-page request was taken off the rest of the range
++};
++
++/// Make [p, p + bytes) RESIDENT - every page faulted in and written once - before CUDA pins it.
++/// cudaHostRegister populates the range itself, inside one ioctl, on one of the driver's threads; on a host
++/// whose page cache holds the model files that one thread waits on the kernel's direct compaction for every
++/// 2 MiB page, and the 119.53 GiB arena took 455 s there - past the server's 900 s start budget.  The engine
++/// makes the same pages resident on several threads instead; the driver then finds them there and only pins
++/// them.  Measured on this PC (119.53 GiB arena, the page cache holding 205 GiB of the model and 15 GiB free):
++/// the driver alone 455 s, the engine's own population 23.7 s plus 6.2 s to register.  With the page cache
++/// cold the same arena registered in 4.2 s the driver's way and 2.4 s this way.
++/// The pages are the same either way; only WHO faults them in changes.  Windows: nothing to do (the arena is
++/// a VirtualAlloc reservation and the driver fills it in one go), so the result is empty there.
++ArenaPopulation populate_host_arena(void* p, uint64_t bytes);
++
+ struct PinnedArena {
+     void* base = nullptr;
+     uint64_t capacity = 0;
+diff --git a/src/core/pinned.cu b/src/core/pinned.cu
+index 12cda847..ef6c14e6 100644
+--- a/src/core/pinned.cu
++++ b/src/core/pinned.cu
+@@ -5,6 +5,8 @@
+ #include <cuda_runtime.h>
+ 
+ #include <atomic>
++#include <algorithm>
++#include <chrono>
+ #include <climits>
+ #include <cerrno>
+ #include <cstdlib>
+@@ -13,6 +15,7 @@
+ #include <fstream>
+ #include <mutex>
+ #include <thread>
++#include <vector>
+ 
+ // Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
+ // spelling is not the same on the two platforms the engine builds for.
+@@ -347,6 +350,125 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
+ }
+ }  // namespace
+ 
++// ---- the arena's pages, made resident BEFORE CUDA pins them -------------------------------
++//
++// `cudaHostRegister` does not only PIN a range, it POPULATES it: the driver faults every page in inside one
++// ioctl, on one of its own threads.  On a PC whose page cache holds the model files, that single thread waits
++// on the kernel's direct compaction for every 2 MiB page it faults in (THP=madvise, defrag=madvise), and the
++// 119.53 GiB expert arena took 455 s that way - past the server's 900 s start budget, so the engine never
++// reported READY and the setup called it dead.  The kernel counters during that registration: compact_stall
++// +95,755, compact_fail +82,816.
++//
++// The engine can make the SAME pages resident itself, on several threads, before the registration: the driver
++// then finds the pages there and only pins them.
++//   measured on this PC (RTX 3090 x4, 251 GiB RAM, Linux, THP=madvise, defrag=madvise), 119.53 GiB arena,
++//   the page cache holding 205 GiB of the model files and 15 GiB free - the state a warm restart finds:
++//       the driver populates it alone              455 s  (compact_stall +95,755)
++//       the engine populates it, 16 threads        23.7 s  (compact_stall +70,020)   [standalone arena]
++//       the registration of that resident arena      6.2 s
++//   the same population inside the engine took 123.5 s there (the engine holds more of the machine while it
++//   runs), and the engine then reported READY at about 235 s; the driver's way never reported READY inside
++//   the server's 900 s budget.
++//   with the page cache cold (144 GiB free) the same arena registered in 4.2 s the driver's way and 2.4 s
++//   this way (32 GiB arena: 4.15 s against 0.62 s + 1.75 s).
++// The pages are the same either way; only WHO faults them in changes.
++//
++// The population WRITES every page once (a write, not a read: a read fault maps the shared zero page, which
++// is not residency - the page must be written to become the arena's own).  A store per 4 KiB is enough: the
++// first store in a 2 MiB region faults the huge page in and the rest of it is there.
++namespace {
++
++// The arena is filled in slices of this size, and the rate is checked between them.
++constexpr uint64_t kPopulateSliceBytes = 256ull << 20;
++// Below this rate the kernel is spending its time compacting for every huge page it is asked for.  Measured:
++// 5.0 GiB/s with the page cache warm and the compaction storm running, 51 GiB/s with the page cache cold, so
++// this threshold sits an order of magnitude below the slow case - it fires only when the arena would take
++// more than two minutes to fill.
++constexpr double kPopulateMinGiBPerSecond = 1.0;
++constexpr int kPopulateMaxThreads = 16;
++
++void write_pages(uint8_t* p, uint64_t bytes) {
++    volatile uint8_t* v = p;   // volatile: the stores must not be optimized away
++    for (uint64_t off = 0; off < bytes; off += 4096) v[off] = 0;
++}
++
++// madvise() wants a page-aligned address and a whole number of pages: the arena is split over the threads in
++// equal parts, and that split does not land on a page boundary, so the range is aligned here.  False when there
++// is nothing left to advise.
++bool drop_huge_pages(uint8_t* p, uint64_t bytes) {
++#ifdef MADV_NOHUGEPAGE
++    if (bytes == 0) return false;
++    const uintptr_t start = (uintptr_t) p;
++    const uintptr_t aligned = (start + 4095) & ~(uintptr_t) 4095;
++    if (aligned - start >= bytes) return false;   // less than a page left
++    return madvise((void*) aligned, (size_t) (bytes - (aligned - start)), MADV_NOHUGEPAGE) == 0;
++#else
++    (void) p;
++    (void) bytes;
++    return false;
++#endif
++}
++
++}  // namespace
++
++ArenaPopulation populate_host_arena(void* p, uint64_t bytes) {
++    ArenaPopulation r;
++    if (p == nullptr || bytes == 0) return r;
++#ifdef _WIN32
++    // Windows: the arena is a VirtualAlloc reservation and the driver fills it in one go; the Windows path is
++    // not what the Linux start budget was measured on, so it stays as it is.
++    (void) bytes;
++    return r;
++#else
++    // STRATA_NO_ARENA_PREPOP=1 is the same-run A/B switch the other STRATA_* arena switches are: the driver
++    // populates the arena itself, as it did before.
++    if (const char* e = std::getenv("STRATA_NO_ARENA_PREPOP")) {
++        if (e[0] != '\0' && std::string(e) != "0") return r;
++    }
++    unsigned hw = std::thread::hardware_concurrency();
++    int threads = (int) (hw < (unsigned) kPopulateMaxThreads ? (hw ? hw : 1u) : (unsigned) kPopulateMaxThreads);
++    const uint64_t chunk = (bytes + (uint64_t) threads - 1) / (uint64_t) threads;
++
++    std::atomic<uint64_t> done{0};
++    std::atomic<bool> huge_pages_dropped{false};
++    const auto t0 = std::chrono::steady_clock::now();
++    std::vector<std::thread> pool;
++    pool.reserve((size_t) threads);
++    for (int t = 0; t < threads; ++t) {
++        const uint64_t start = (uint64_t) t * chunk;
++        if (start >= bytes) break;
++        const uint64_t end = std::min(bytes, start + chunk);
++        pool.emplace_back([p, start, end, &done, &huge_pages_dropped, t0]() {
++            uint8_t* base = (uint8_t*) p + start;
++            uint64_t off = 0;
++            bool dropped = false;   // this thread's own range: the advice is per range, not global
++            while (off < end - start) {
++                const uint64_t n = std::min(kPopulateSliceBytes, end - start - off);
++                write_pages(base + off, n);
++                off += n;
++                done.fetch_add(n, std::memory_order_relaxed);
++                // The rate tells whether the kernel is compacting for every huge page: the huge-page request
++                // is then taken off the rest of THIS thread's range, and 4 KB pages need no compaction at all.
++                const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++                const double gib = (double) done.load(std::memory_order_relaxed) / (double) (1ull << 30);
++                if (!dropped && elapsed > 0.5 && gib / elapsed < kPopulateMinGiBPerSecond) {
++                    if (drop_huge_pages(base + off, end - start - off)) {
++                        dropped = true;
++                        huge_pages_dropped.store(true, std::memory_order_relaxed);
++                    }
++                }
++            }
++        });
++    }
++    for (std::thread& th : pool) th.join();
++    r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    r.threads = threads;
++    r.bytes = bytes;
++    r.huge_pages_dropped = huge_pages_dropped.load(std::memory_order_relaxed);
++    return r;
++#endif
++}
++
+ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
+     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
+ }
+@@ -361,9 +483,36 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
+         mapping_bytes = bytes;
+     }
+ 
+-    // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
+-    // that has already been faulted in page by page is far more expensive to register and may fail outright.
++    // Register with CUDA BEFORE the arena's CONTENTS are written, and make the pages resident first.
++    //
++    // The old order was: register the untouched mapping and let the driver fault the pages in while it pins
++    // them.  That is one thread inside one driver ioctl, and on a host whose page cache holds the model files
++    // it took 455 s for the 119.53 GiB arena in a benchmark and about 800 s inside the engine (READY at 883 s,
++    // 17 s inside the server's 900 s start budget; on a busier start it was not enough and the server called
++    // the engine dead).  The pages are now faulted in by the engine's own threads (populate_host_arena: 24.8 s
++    // inside the engine, 23.7 s in the benchmark, for the same arena in the same state) and the driver only
++    // pins them.
++    //
++    // Nothing is written to the arena HERE: the population only makes the pages resident (one store per page,
++    // which is what the kernel's own fault handler writes anyway), so the arena still holds zeros when the
++    // load fills it.
+     if (base) {
++        // A shared-file arena is a MAP_SHARED mapping of a file: writing into it would change the file, so it
++        // is left as it was (the driver populates it).  Large pages are resident from the start.
++        const bool anonymous_arena = shared_file.empty() && backing == PageBacking::NormalPages;
++        // Below 1 GiB the driver fills the range in milliseconds: there is nothing to win there.
++        if (anonymous_arena && bytes >= (1ull << 30)) {
++            const ArenaPopulation pop = populate_host_arena(base, bytes);
++            if (pop.bytes > 0) {
++                char buf[256];
++                std::snprintf(buf, sizeof buf, "arena populated in %.1f s on %d threads before the registration",
++                              pop.seconds, pop.threads);
++                note += std::string("; ") + buf +
++                        (pop.huge_pages_dropped
++                             ? " (the huge-page request was taken off the rest of the arena: this host was too slow to compact)"
++                             : "");
++            }
++        }
+         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
+         const int env_gib = arena_pin_cap_gib();
+         uint64_t cap = max_pinned_bytes;
+diff --git a/tests/core/arena_populate_test.cpp b/tests/core/arena_populate_test.cpp
+new file mode 100644
+index 00000000..b96c9de8
+--- /dev/null
++++ b/tests/core/arena_populate_test.cpp
+@@ -0,0 +1,110 @@
++// tests/core/arena_populate_test.cpp - the expert arena's pages are resident BEFORE CUDA pins them.
++//
++// The arena is 119.53 GiB on this model, and cudaHostRegister POPULATES the range it is given: one driver
++// thread, one ioctl, and on a host whose page cache holds the model files that thread waits on the kernel's
++// direct compaction for every 2 MiB page (455 s, past the server's 900 s start budget).  The engine therefore
++// makes the pages resident itself, on several threads, before the registration.
++//
++// What this test pins down:
++//   * every page of the range is RESIDENT afterwards (a range that was only mapped, or only read, is not
++//     resident: a read fault maps the shared zero page),
++//   * the pages still hold ZEROS, so the arena is empty for the load that fills it,
++//   * the call reports what it did (the bytes, the threads, the time), because the startup print says it.
++//
++// The residency check reads /proc/self/smaps, NOT mincore: mincore's answer is a BITPACKED byte per eight
++// pages, and the kernel this was measured on (6.17.0-41-generic) writes ONE BYTE PER PAGE instead - a vector
++// sized the documented way is then written past its end.  smaps says the same thing (the Rss of the mapping)
++// and cannot overflow anything.
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "strata/core/pinned.hpp"
++
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++
++namespace {
++
++int failures = 0;
++
++void check(bool ok, const std::string& what) {
++    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++
++// The resident bytes of [p, p + bytes) according to /proc/self/smaps: the Rss of every mapping that overlaps
++// the range, added up.  A mapping is reported as a whole, so the caller keeps the range between two PROT_NONE
++// guards - then the only mapping that overlaps it IS it, and the number is exact.
++uint64_t resident_bytes_smaps(const void* p, uint64_t bytes) {
++    std::FILE* f = std::fopen("/proc/self/smaps", "r");
++    if (f == nullptr) return 0;
++    const uint64_t lo = (uint64_t) (uintptr_t) p, hi = lo + bytes;
++    uint64_t rss = 0;
++    bool overlaps = false;
++    char line[512];
++    while (std::fgets(line, sizeof line, f) != nullptr) {
++        // A mapping header looks like "7f9c2c000000-7f9c2c400000 rw-p 00000000 00:00 0 ".
++        unsigned long long a = 0, b = 0;
++        if (std::sscanf(line, "%llx-%llx", &a, &b) == 2) {
++            overlaps = (b > lo && a < hi);
++            continue;
++        }
++        if (!overlaps) continue;
++        unsigned long long kb = 0;
++        if (std::sscanf(line, "Rss: %llu kB", &kb) == 1) rss += kb * 1024ull;
++    }
++    std::fclose(f);
++    return rss;
++}
++
++}  // namespace
++
++int main() {
++    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    const size_t bytes = (size_t) 512 << 20;   // 512 MiB: enough pages to be a real test, small enough for CI
++    // One reservation, guards at both ends: the mapping under test cannot be merged with a neighbour, so its
++    // Rss in smaps is the range's and nothing else.
++    const size_t total = bytes + 2 * page;
++    char* region = (char*) mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (region == MAP_FAILED) {
++        std::printf("FAIL cannot map %zu bytes\n", total);
++        return 1;
++    }
++    if (mprotect(region, page, PROT_NONE) != 0 || mprotect(region + page + bytes, page, PROT_NONE) != 0) {
++        std::printf("FAIL cannot guard the mapping\n");
++        return 1;
++    }
++    void* p = region + page;
++
++    const uint64_t before = resident_bytes_smaps(p, bytes);
++    check(before == 0, "a freshly mapped range has no resident pages");
++
++    const strata::core::ArenaPopulation pop = strata::core::populate_host_arena(p, bytes);
++    check(pop.bytes == bytes, "the population reports the bytes it was given");
++    check(pop.threads >= 1, "the population reports the threads it used");
++    check(pop.seconds >= 0.0, "the population reports its time");
++
++    const uint64_t after = resident_bytes_smaps(p, bytes);
++    check(after >= bytes, "every page of the range is resident afterwards");
++
++    const unsigned char* q = (const unsigned char*) p;
++    bool zeros = true;
++    for (size_t i = 0; i < bytes; i += page) {
++        if (q[i] != 0) { zeros = false; break; }
++    }
++    check(zeros, "the pages still hold zeros: the arena is empty for the load");
++
++    munmap(region, total);
++    std::printf("%s\n", failures == 0 ? "arena_populate_test: ok" : "arena_populate_test: FAILED");
++    return failures == 0 ? 0 : 1;
++}
++#else
++int main() {
++    std::printf("arena_populate_test: skipped (Linux only)\n");
++    return 0;
++}
++#endif

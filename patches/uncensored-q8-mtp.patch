@@ -1,0 +1,637 @@
+diff --git a/docs/UNCENSORED_Q8.md b/docs/UNCENSORED_Q8.md
+new file mode 100644
+index 00000000..d1c02578
+--- /dev/null
++++ b/docs/UNCENSORED_Q8.md
+@@ -0,0 +1,269 @@
++# Uncensored Q8_0-MTP (5 shards, integrated draft block)
++
++**Status: working.** A community Q8_0 quantization with an integrated MTP draft block
++(`qwen4exp.block_count = 49`, `qwen4exp.nextn_predict_layers = 1`) runs on the
++native GGUF path after three small MTP-awareness fixes (packer, arch guard, dense
++walk). Validated on 4x RTX 3090 (sm_86) + 256 GB DDR4, Linux, CUDA 12.4, engine
++0.1.43 + local patches.
++
++> **On this page:** [What is in the file](#what-is-in-the-file) · [The pack](#the-pack-by-hand) ·
++> [The server](#the-server) · [Speed](#what-to-expect) · [Quality](#quality) ·
++> [What the engine did not have](#what-the-engine-did-not-have-and-has-now) ·
++> [Known issues](#known-issues)
++
++## What is in the file
++
++Five shards, ~179 GB together (`Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-0000N-of-00005.gguf`),
++plus `mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf` (866 MB vision encoder).
++
++`tools/quantscope.py` on the folder (header ground truth, not the file names):
++
++| Group | Weights | GB | Types |
++| --- | --- | --- | --- |
++| Routed experts (49 blocks) | 123.31B | 131.02 | Q8_0 100% |
++| PLE table (`per_layer_token_embd.weight` [160, 320001536], shard 2 alone) | 51.23B | 54.44 | Q8_0 100% |
++| Attention, hyper-connections, token embedding, output head, SSM | — | ~4.3 | Q8_0 ~100% |
++| Routers, norms | — | ~0.3 | F32 |
++| MTP draft (blk.48: full MoE + `nextn.*`, 29 tensors) | 0.01B | ~0.0 | Q8_0 / F32 |
++
++- Every expert role in every block is Q8_0 (ggml type 8): gate/up/down `8/8` in all
++  49 blocks. No mixed types, no per-role shard splits (`native_experts.txt` v3).
++- Block 48 is the integrated MTP draft: `blk.48.ffn_*_exps` (same [2560, 640, 512]
++  shapes as the main blocks) plus `blk.48.nextn.{hnorm,enorm,eh_proj,hc_head_*}`.
++  The target forward runs blocks 0-47 (48 layers); the draft is served from `mtp/rt`.
++- `qwen4exp.expert_count = 512`, `expert_used_count = 10`, `embedding_length = 2560`.
++
++## The pack (by hand)
++
++```sh
++.venv/bin/python tools/iq_pack.py \
++  --gguf /path/to/Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00001-of-00005.gguf \
++  --out packs/uncensored-q8 --compat-bf16
++```
++
++Under a minute. Writes `index.txt` (1079 tensors, 303 served natively, arena
++1.38 GiB), `dense.bin` (1.3 GB), `native_experts.txt` (48 rows, all `8 8`,
++131 GB total), the tokenizer, `conversions.json` (483 converted: 96 exact,
++387 rounded to BF16, max |err| 0.0144) and `compat-bf16.json`.
++**`--compat-bf16` is required** (F32 routers/norms, Q8_0 hyper-connection
++projections the engine reads as BF16). Do not add `--experts-bin`: the 128 GB
++of experts stay in the GGUF files. The packer prints two `mtp:` lines: the
++excluded draft block and the 29 draft tensors left in the GGUF.
++
++## The server
++
++`--mtp` is the **integrated** draft (`mtp/rt-uncensored`, built from blk.48 by
++`tools/mtp_from_gguf.py` — no download). The base draft (`mtp/rt`, section below)
++stays on disk as a fallback; one `--mtp` path switch compares them.
++
++## Integrated draft (`tools/mtp_from_gguf.py`)
++
++`--mtp mtp/rt-uncensored`, built from the file's own blk.48:
++
++```sh
++.venv/bin/python tools/mtp_from_gguf.py \
++  --gguf /path/to/...-00001-of-00005.gguf --out mtp/rt-uncensored
++cp data/draft_vocab.bin mtp/rt-uncensored/draft_vocab.bin
++```
++
++The runtime contract (`dense.txt` names/kinds/dims) is set-for-set identical to
++`mtp_rt.py`'s 29 lines. Experts fuse gate/up along rows (lossless) and requant to
++the draft Q2_0 grid (draft-only rounding); Q8_0 dense is reused byte for byte;
++`index_qk_proj` concats q/k rows and `fc_embedding`/`fc_hidden` split `eh_proj`
++along columns (both lossless). Norms take mtp_rt's Gemma +1; hc/mixer/router go
++Q8_0/F32 → BF16 (ggml nearest-even).
++
++- blk.48 is a genuinely different draft from the base (rel RMS 0.43 on gate
++  expert 0 — not quant noise), so this is not a re-encoding of the base MTP.
++- eh order falsified live: `--swap-eh` (hid,emb) drafts **0/0 tokens**; the
++  default emb,hid order drafts at 66%. A wrong mapping fails loudly in
++  acceptance, never silently in quality (the target verifies every token).
++- Acceptance: **66%** (93/140) vs the base draft's 79% — the cost of Q8_0→Q2_0
++  double quantization plus fine-tune drift. ~10% decode slower than base-draft
++  config; everything else identical. Switch back with one `--mtp` path change.
++
++## Base draft (fallback, `mtp/rt`)
++
++Once (base MTP via range requests + local pack, ~0.9 GB):
++
++```sh
++.venv/bin/python tools/mtp_fetch.py inventory --out mtp-fetch
++.venv/bin/python tools/mtp_fetch.py fetch --out mtp-fetch
++.venv/bin/python tools/mtp_fetch.py verify --out mtp-fetch
++mkdir -p mtp
++.venv/bin/python tools/mtp_pack.py --src mtp-fetch --experts q2_0 --out mtp/mtp-q2_0.gguf
++.venv/bin/python tools/mtp_rt.py --gguf mtp/mtp-q2_0.gguf --out mtp/rt
++cp data/draft_vocab.bin mtp/rt/draft_vocab.bin
++```
++
++79% acceptance on this target (166/210). One `--mtp` switch to compare.
++
++`strata-uncensored-q8.json` (4x 24 GB, 256 GB RAM — everything fits, no RAM budget):
++
++```json
++{
++  "exe": "build/strata",
++  "args": [
++    "--pack", "packs/uncensored-q8",
++    "--native", "/path/to/...-00001-of-00005.gguf",
++    "--expert-profile", "data/expert-profile.bin",
++    "--expert-cache", "auto",
++    "--prefill", "auto",
++    "--spec", "4", "--spec-min-p", "0.5",
++    "--mtp", "mtp/rt-uncensored",
++    "--pipeline-windows", "2",
++    "--kv", "k8v4",
++    "--max-context", "32768"
++  ],
++  "gpu": [0, 1, 2, 3],
++  "layer_split": "auto",
++  "tokenizer": "packs/uncensored-q8/tokenizer",
++  "model_name": "qwen3.8-flash-next-uncensored-q8_0",
++  "vision": {
++    "exe": "engine/strata-vision",
++    "mmproj": "/path/to/mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf",
++    "model": "/path/to/...-00001-of-00005.gguf",
++    "gpu": false, "threads": 32, "max_tokens": 1024
++  }
++}
++```
++
++The vision encoder (`tools/vision`, `STRATA_VISION_CUDA=ON`, sm_86) is a separate
++build; images verified end-to-end with the uncensored mmproj (CPU encoder first;
++GPU needs VRAM headroom the 4-way split does not currently leave).
++
++## What to expect
++
++4x RTX 3090, EPYC 7532 (AVX2, no AVX-512), 256 GB DDR4, layer split `K=10,23,35`
++without trim (`K=11,23,35`), caches ~14.4k/24.6k pairs (~93% routed mass):
++
++| Step | Short-chat decode | Notes |
++| --- | --- | --- |
++| 1 GPU, no MTP | 8.7 tok/s | gate test only (1500 cache slots) |
++| 4-GPU split, no MTP | 59-70 tok/s | suffix drafts only, hit rate 96-99% |
++| + base MTP (`mtp/rt`) | 79 tok/s | drafts 166/210 (79%) |
++| + `--pipeline-windows 2` | 85 tok/s | 4 stages overlap; text-identical to serial |
++| + `--kv k8v4`→`int8` + resident 32K | 89 tok/s | 262K needs streaming; int8 is the lossless default |
++| + calibrate (pcie 0, 8 workers, adapt 1/160/0.97, spec-min-p 0.7) | ~105 tok/s | `tools/calibrate.py` verdict below |
++| + integrated MTP (`mtp/rt-uncensored`, current) | ~78 tok/s fresh | drafts 93/140 (66%); file's own draft |
++
++Prompts: 4K ~870 tok/s, 16K ~1970 tok/s, 32K ~2480 tok/s, 253K ~3180 tok/s.
++Short chat decode 72.5 tok/s bench median (integrated draft; base-draft config
++measured 85.5). Reports: `bench/results/2026-10-13-community-4x-rtx-3090-*`.
++
++## 262K context + int8 KV (the end state)
++
++`--max-context 262144 --kv int8 --kv-resident 32768`: KV streaming keeps 32K
++cells/layer in VRAM, the rest in 0.52 GiB of pinned RAM. Native 262144 needs no
++RoPE flag. Measured:
++
++| Test | Result |
++| --- | --- |
++| 253,256-token prompt, fresh | 3234 tok/s prefill (78 s), then 80 tok/s decode |
++| Needle (`BLUE-DRAGON-42` at 50% of 253K) | retrieved exactly |
++| Same prompt again (prompt cache 253,251 reused) | 0.9 s total, 107 tok/s decode |
++
++## Calibrate verdict (this box: EPYC 7532 + 4x3090, Q8)
++
++- `--pcie-frac 0` (+4% over default 0.55: hit rates are 96-99%, PCIe share hurts)
++- `--pool-workers 8` (31: 98.0, 21: 100.3, 16: 103.4, **8: 104.6** — bandwidth-bound)
++- `--adapt-every 1 --adapt-swaps 160 --adapt-decay 0.97` (101.9 vs 98.1 default)
++- `--spec-min-p 0.7` (kept)
++
++## Quality
++
++- `native_expert_parity --synthetic q8_0/q8_0`: CPU rel 1.27e-2 and GPU rel
++  1.27e-2 vs float (quantization noise, same band as Q4_0's 1.1-1.3e-2),
++  CPU-vs-GPU 1.09e-7, GPU dequant vs ggml `to_float` bit-exact (0 of 4,915,200
++  differ). **0 failures.**
++- MTP acceptance 79% (166/210) with the base draft on this uncensored target —
++  the target distribution aligns; output tokens are always target-verified.
++- Generations checked by hand (LRU-cache coding prompt: correct; image
++  description: correct). Teacher-forced KL vs llama.cpp on this file: not yet
++  measured.
++
++## What the engine did not have, and has now
++
++Files with an integrated MTP draft block (`qwen4exp.nextn_predict_layers = 1`,
++`block_count = 49`):
++
++- **Packer** (`tools/iq_pack.py`): `expert_layout` packs only the main blocks
++  (`n_layers = max_blk + 1 - nextn`); `index_standalone` leaves the draft
++  block's 29 tensors in the GGUF for the mtp tools instead of indexing
++  unloadable shape-only rows. Files without the key pack byte-for-byte as before.
++- **Arch guard** (`include/strata/artifact/gguf_reader.hpp`): `check_architecture`
++  expects `block_count = 48 + nextn_predict_layers` (absent key: unchanged).
++- **Dense walk** (`src/core/native_dense.cpp`): `load`, `weight_bytes_for` and
++  `served_names` skip the draft blocks (`draft_cut`/`is_draft` from the shards'
++  own metadata), keeping the three walks in step. Geometry stays 48 everywhere.
++
++## Known issues
++
++- `STRATA_STAGE_TRIM=1` on this 4-way native-Q8 split: the engine dies silently
++  during cache fill (log ends after the `GPU 0` line, no error; without trim the
++  same config loads). Trim predicted 96.1% cached vs 92.9% and -16%/window, so
++  it is worth retrying on a newer engine with a debugger attached. Without trim
++  everything above holds.
++- The integrated blk.48 draft is live (`mtp/rt-uncensored`, 66% acceptance vs the
++  base's 79% — Q8_0→Q2_0 double quantization plus fine-tune drift). The base
++  draft stays as a one-switch fallback. Revisit if acceptance drops on some
++  workload.
++- `--pipeline-windows 2` and `--adapt-async 1` are mutually exclusive on 3+
++  stages (the engine turns the pipeline off with a one-line note). Measured
++  here: pipeline 85.2 vs async 80.6 tok/s — pipeline kept.
++- CPU has no AVX-512 (EPYC Zen 2): expert miss path runs AVX2 kernels.
++  `tools/calibrate.py` verdict: `--pcie-frac 0 --pool-workers 8 --spec-min-p 0.7
++  --adapt-every 1 --adapt-swaps 160 --adapt-decay 0.97` (all in the live config).
++
++## Speed vs quality: what costs what
++
++Short answer: the speed comes from doing less work per token, not from cheaper
++weights — output quality is the target's own everywhere it matters:
++
++- **MTP speculative decoding** (either draft): quality-neutral by construction.
++  The target verifies every draft token; accepted or not, final tokens equal a
++  non-speculative run. Acceptance (66% integrated, 79% base) sets speed only.
++- **`--pipeline-windows 2`**: no quality trade by design — "the tokens are the
++  serial loop's" (docs/MULTI_GPU.md), verified identical greedy text.
++- **`--kv int8` + streaming**: int8 KV is the default fidelity (the lossy
++  opt-ins are q4/k8v4's 4-bit V). 253K needle retrieved exactly; a repeated
++  253K prompt reuses 253,251 cached tokens with identical output.
++- **`--pcie-frac 0`**: misses run on the CPU's ggml-exact kernels instead of GPU
++  approximations — if anything more faithful (measured CPU-GPU gap: 1e-7).
++- **Workers/adapt/prefill-help**: same kernels, different scheduling/placement.
++  GPU-vs-CPU placement can flip near-ties (last-bit rounding), same class as
++  the default adaptive tier — upstream "same quality" (+ cache-parity bench).
++- **Defaults left on**: route-tail-skip (skips rank≥7 routed misses, +10-20%
++  decode; the one documented token-changer) and prefill CPU share (mean KL
++  ~0.004). Disable with `STRATA_ROUTE_TAIL_SKIP=0` / `STRATA_PREFILL_CPU_SHARE=0`
++  for a paranoia A/B — if outputs match, nothing was lost.
++- **`--compat-bf16`**: one-time max err 0.0144 on small projections only (same
++  profile as UD-Q4_K_XL); experts and PLE table are byte-identical to the GGUF.
++
++## Strata vs llama.cpp on the same file (2026-10-13)
++
++llama-server 0.3.0-dev (build 10802) with the owner's daily-driver flags
++(`--spec-type draft-mtp --spec-draft-n-max 2 --split-mode layer --fit on
++--n-cpu-moe 45 -t 32 --ctx-size 262144 --cache-type-k/v q8_0 --rope-scaling yarn
++--rope-scale 32`), same prompts, greedy both sides. Raw captures:
++`bench/results/2026-10-13-community-4x-rtx-3090-uncensored-q8-0-integrated-262k/cmp_*.json`
++(speed set) and `grade_*.json` (executed-code set).
++
++| Task | llama.cpp | Strata (this config) |
++| --- | --- | --- |
++| Needle 8K (`BLUE-DRAGON-42`) | found | found |
++| Needle 253K | not run (108 tok/s prefill → ~40 min) | **exact** |
++| Math (75; 541) | 75 ✓ / 541 ✓ | 75 ✓ / 541 ✓ |
++| Factual (Ouagadougou) | ✓ | ✓ |
++| LRU, executed | PASS | PASS |
++| fib, executed | PASS (byte-identical code both sides) | PASS |
++| Decode | 24-29 tok/s | **65-109 tok/s (2.5-3.5x)** |
++| Prefill | 25-124 tok/s | **110-3180 tok/s (9-30x)** |
++| Draft acceptance | 86% (n-max 2) | 66-71% (spec 4) |
++
++No quality loss on Strata: every graded answer matches. The speed gap is
++offloading, not weights — llama's fit keeps most of the 179 GB on CPU
++(VRAM 6/5/5/16 GB) with ubatch 512 on a bandwidth-bound EPYC, while the split
++holds ~93% of routed experts on the GPUs. (Llama was not tested at 253K input;
++its yarn-32 RoPE vs Strata's native 262144 is a real long-context difference —
++both retrieve exactly at the ranges measured.)
+diff --git a/include/strata/artifact/gguf_reader.hpp b/include/strata/artifact/gguf_reader.hpp
+index 1be01432..afa8e574 100644
+--- a/include/strata/artifact/gguf_reader.hpp
++++ b/include/strata/artifact/gguf_reader.hpp
+@@ -593,8 +593,14 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
+         const char* key;
+         uint64_t want;
+     };
++    // Files with an integrated MTP draft block (qwen4exp.nextn_predict_layers, e.g. the Uncensored Q8_0-MTP
++    // file with block_count 49): the target geometry stays `want.block_count` layers, the trailing block is
++    // the draft layer served from mtp/rt. Absent the key nothing changes.
++    uint64_t blocks_want = want.block_count;
++    if (const MetaValue* n = g.get("qwen4exp.nextn_predict_layers"))
++        if (n->is_num()) blocks_want += n->u;
+     const Req reqs[] = {
+-        {"qwen4exp.block_count", want.block_count},
++        {"qwen4exp.block_count", blocks_want},
+         {"qwen4exp.embedding_length", want.hidden},
+         {"qwen4exp.expert_count", want.experts},
+         {"qwen4exp.expert_used_count", want.experts_used},
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index e0775a6a..0d08ada4 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -37,6 +37,23 @@ bool in_range(const std::string& name) {
+     const int l = std::atoi(name.c_str() + 4);
+     return l >= g_layer_lb && l < g_layer_le;
+ }
++// Files with an integrated MTP draft block (qwen4exp.nextn_predict_layers, e.g. the Uncensored Q8_0-MTP file
++// with block_count 49): the first blk.* index that belongs to the draft, or `hold` when the shard carries no
++// such metadata. The target walk skips those blocks the way it skips another stage's layers; the draft is
++// served from mtp/rt, and the pack does not index them.
++int draft_cut(const strata::GgufFile& gguf, int hold) {
++    if (hold >= 0) return hold;
++    const auto* blocks = gguf.get("qwen4exp.block_count");
++    const auto* nextn = gguf.get("qwen4exp.nextn_predict_layers");
++    if (!blocks || !blocks->is_num() || !nextn || !nextn->is_num() || nextn->u == 0) return hold;
++    if (nextn->u > blocks->u) return hold;
++    return (int) (blocks->u - nextn->u);
++}
++// True for a blk.<l>. tensor of the integrated draft (see draft_cut): skipped by the target walk.
++bool is_draft(const std::string& name, int cut) {
++    if (cut < 0 || name.rfind("blk.", 0) != 0) return false;
++    return std::atoi(name.c_str() + 4) >= cut;
++}
+ // S23 experiment (STRATA_HC_Q8=1): the hyper-connection projections' Q8_0 bytes for the verify read
+ bool hc_q8_requested() {
+     static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8"); return v != nullptr && v[0] == '1'; }();
+@@ -113,11 +130,13 @@ struct Pending {
+ bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
+                                std::set<std::string>& out, std::string& err) {
+     try {
++        int cut = -1;
+         for (const auto& path : shards) {
+             strata::GgufFile gguf(path);
++            cut = draft_cut(gguf, cut);
+             for (const auto& tensor : gguf.tensors())
+                 if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+-                    tensor.shape.size() == 2)
++                    tensor.shape.size() == 2 && !is_draft(tensor.name, cut))
+                     out.insert(tensor.name);
+         }
+         return true;
+@@ -138,13 +157,16 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
+     try {
+         std::set<std::string> seen;
+         uint64_t total = 0;
++        int cut = -1;
+         for (const auto& path : shards) {
+             strata::GgufFile gguf(path);
++            cut = draft_cut(gguf, cut);
+             for (const auto& tensor : gguf.tensors()) {
+                 if (!eligible(tensor, include_ple_key)) continue;
+                 if (tensor.name.rfind("blk.", 0) == 0) {
+                     const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                     if (l < lb || l >= le) continue;
++                    if (is_draft(tensor.name, cut)) continue;
+                 }
+                 if (!seen.insert(tensor.name).second) continue;
+                 auto found = table.table_.find(tensor.name);
+@@ -204,8 +226,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+         uint64_t split_count = 0, split_tensors = 0;
+         std::set<uint64_t> split_numbers;
+         bool have_architecture = false;
++        int cut = -1;   // the integrated draft's first block (draft_cut), once a shard carries the metadata
+         for (const auto& path : shards) {
+             strata::GgufFile gguf(path);
++            cut = draft_cut(gguf, cut);
+             const auto* count = gguf.get("split.count");
+             const auto* number = gguf.get("split.no");
+             const auto* tensors = gguf.get("split.tensors.count");
+@@ -268,6 +292,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+             }
+             for (const auto& tensor : gguf.tensors()) {
+                 if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
++                if (is_draft(tensor.name, cut)) continue;
+                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                 if (!seen.insert(tensor.name).second) {
+                     err = "native dense: duplicate tensor " + tensor.name; return false;
+diff --git a/tools/iq_pack.py b/tools/iq_pack.py
+index 5ce0e4a5..eecab2e1 100644
+--- a/tools/iq_pack.py
++++ b/tools/iq_pack.py
+@@ -275,9 +275,23 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
+     """Every non-expert tensor of the model: the floats the engine reads from the pack into dense.bin in the form it
+     reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
+     todo, problems = [], []
++    # The integrated MTP draft block (the qwen4exp.nextn_predict_layers trailing blocks, e.g. blk.48 of the
++    # Uncensored Q8_0-MTP file) is not indexed: the target forward never reads it - drafts come from mtp/rt -
++    # and its shape-only native rows would be refused at load ("only in its GGUF form"). The draft stays in
++    # the GGUF for the mtp tools. Files without the key skip nothing.
++    nextn = int(model.files[0].metadata.get("qwen4exp.nextn_predict_layers", 0) or 0)
++    n_main, skipped_mtp = None, 0
++    if nextn:
++        tops = [int(m.group(1)) for m in (re.match(r"blk\.(\d+)\.", n) for n in model.where) if m]
++        n_main = (1 + max(tops)) - nextn if tops else None
+     for name, (g, t, mm, p) in model.where.items():
+         if is_expert(t.name) or t.name in NOT_IN_PACK:
+             continue
++        if n_main is not None:
++            m = re.match(r"blk\.(\d+)\.", name)
++            if m and int(m.group(1)) >= n_main:
++                skipped_mtp += 1
++                continue
+         if len(t.shape) > 2:
+             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
+             return 1
+@@ -296,6 +310,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
+         if len(problems) > 8:
+             print("... and %d more" % (len(problems) - 8))
+         return 1
++    if skipped_mtp:
++        print("mtp: %d draft-block tensor(s) left in the GGUF for the mtp tools, not indexed" % skipped_mtp)
+     rows, at = [], 0
+     served = 0
+     converted, records = [], []
+@@ -436,6 +452,17 @@ def expert_layout(model: Model, src: pathlib.Path):
+     if not exps:
+         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
+     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
++    # Files with an integrated MTP draft block (qwen4exp.nextn_predict_layers, e.g. the Uncensored Q8_0-MTP
++    # file: block_count 49, block 48 carrying blk.48.nextn.* plus a full MoE) pack only the main blocks. The
++    # engine runs 48 target layers and serves drafts from mtp/rt, so a 49th row would be refused at load
++    # (expert_layout_load: l >= n_layers). Files without the key keep every block, byte for byte.
++    nextn = int(model.files[0].metadata.get("qwen4exp.nextn_predict_layers", 0) or 0)
++    if nextn:
++        if nextn >= n_layers:
++            return "qwen4exp.nextn_predict_layers = %d leaves no main block" % nextn
++        n_layers -= nextn
++        print("mtp: %d trailing block(s) are the integrated draft layer, packed as target layers 0-%d"
++              % (nextn, n_layers - 1))
+     n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
+     if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
+         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
+diff --git a/tools/mtp_from_gguf.py b/tools/mtp_from_gguf.py
+new file mode 100644
+index 00000000..640af46e
+--- /dev/null
++++ b/tools/mtp_from_gguf.py
+@@ -0,0 +1,202 @@
++"""tools/mtp_from_gguf.py - the MTP draft runtime from a GGUF with an INTEGRATED draft block.
++
++    python tools/mtp_from_gguf.py \
++      --gguf /path/to/Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00001-of-00005.gguf \
++      --out mtp/rt-uncensored [--swap-eh]
++
++Some files (qwen4exp.nextn_predict_layers = 1) carry their MTP draft as the last block
++(blk.48 here) instead of needing tools/mtp_fetch.py. This builds the same mtp/rt layout
++tools/mtp_rt.py writes (experts.bin in the engine blob layout, dense.bin + dense.txt),
++from blk.N's GGUF-native tensors:
++
++  experts      gate/up fused along rows (lossless byte concat of Q8_0 rows), requantized to the
++               draft Q2_0 grid with mtp_pack's MSE scale search; down likewise. Draft-only rounding.
++  dense Q8_0   attention, shared expert, indexer projections: reused byte for byte. The fused
++               indexer.index_qk_proj is q_proj rows ++ k_proj rows (512 + 128 = 640: lossless concat).
++               fc_embedding/fc_hidden split nextn.eh_proj along columns (blocks 0:80 / 80:160 of each
++               row: lossless); --swap-eh takes hid,emb order when the default emb,hid order drafts nothing.
++  dense BF16   hyper-connection + mixer projections (Q8_0 dequant) and the F32 router, ggml's
++               round-to-nearest-even (iq_pack.bf16_bytes), like --compat-bf16.
++  dense F32    norms as F32 with the Gemma +1 (mtp_rt's rule).
++
++The concatenation/split orders are falsifiable: a wrong one drafts ~0% and the target still verifies
++every token, so output quality never depends on them - only speed does. Acceptance >= the base draft's
++(~79%) confirms the mapping.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++from _paths import add_gguf_py  # noqa: E402
++add_gguf_py()
++from gguf import GGMLQuantizationType as Q, quants  # noqa: E402
++
++from iq_pack import Model, bf16_bytes  # noqa: E402 (Model: split shards; bf16_bytes: ggml BF16 rounding)
++from mtp_pack import q2_0  # noqa: E402 (draft Q2_0 grid, MSE scale search)
++from mtp_rt import blob_of, H, FF, NE  # noqa: E402 (engine blob layout; H=2560 FF=640 NE=512)
++
++BLK = "blk.48."
++Q8_ROW = 34  # bytes per 32 values
++
++
++def q8_rows(raw: np.ndarray, rows: int, cols: int) -> np.ndarray:
++    """Raw Q8_0 bytes [rows, cols//32 * 34] -> float32 [rows, cols] (ggml reference dequant)."""
++    assert raw.size == rows * (cols // 32) * Q8_ROW, (raw.size, rows, cols)
++    return quants.dequantize(raw, Q.Q8_0).astype(np.float32).reshape(rows, cols)
++
++
++def expert_bytes(model: Model, name: str, e: int, rows: int, cols: int) -> np.ndarray:
++    """Expert e's raw Q8_0 bytes of a [cols, rows, NE] GGUF tensor."""
++    g, t, mm, _ = model.where[name]
++    row_bytes = cols // 32 * Q8_ROW
++    base = g.data_start + t.offset + e * rows * row_bytes
++    return np.asarray(mm[base: base + rows * row_bytes])
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--gguf", required=True, help="shard 1 of the file with the integrated draft block")
++    ap.add_argument("--out", required=True, help="runtime dir to write (experts.bin, dense.bin, dense.txt)")
++    ap.add_argument("--blk", type=int, default=48, help="draft block number (default 48)")
++    ap.add_argument("--swap-eh", action="store_true",
++                    help="split eh_proj as hid,emb instead of emb,hid (see docstring)")
++    a = ap.parse_args()
++    out = Path(a.out)
++    out.mkdir(parents=True, exist_ok=True)
++    B = f"blk.{a.blk}."
++    model = Model(Path(a.gguf))
++    log = []
++
++    def src_bytes(name: str, want_type: str | None = None) -> bytes:
++        g, t, mm, p = model.where[B + name]
++        if want_type is not None:
++            assert t.type_name == want_type, (name, t.type_name, want_type)
++        n = t.expected_bytes()
++        b = bytes(np.asarray(mm[g.data_start + t.offset: g.data_start + t.offset + n]))
++        log.append({"tensor": B + name, "shard": p.name,
++                    "source_sha256": hashlib.sha256(b).hexdigest()})
++        return b
++
++    # ---- experts: fuse gate/up along rows (lossless), requant to the draft Q2_0 grid ----
++    with open(out / "experts.bin", "wb") as f:
++        for e in range(NE):
++            gate = q8_rows(expert_bytes(model, B + "ffn_gate_exps.weight", e, FF, H), FF, H)
++            up = q8_rows(expert_bytes(model, B + "ffn_up_exps.weight", e, FF, H), FF, H)
++            dn = q8_rows(expert_bytes(model, B + "ffn_down_exps.weight", e, H, FF), H, FF)
++            gu = q2_0(np.concatenate([gate, up], axis=0)).reshape(2 * FF, H // 64 * 18)
++            dq = q2_0(dn).reshape(H, FF // 64 * 18)
++            f.write(blob_of(gu, dq))
++    print(f"experts.bin {NE} blobs from {B}ffn_*_exps (Q8_0 -> draft Q2_0)", flush=True)
++
++    # ---- dense ----
++    lines, off = [], 0
++    with open(out / "dense.bin", "wb") as f:
++        def emit(short: str, kind: str, rows: int, cols: int, raw: bytes):
++            nonlocal off
++            want = {"q8_0": rows * (cols // 32) * Q8_ROW,
++                    "bf16": rows * cols * 2, "f32": rows * cols * 4}[kind]
++            assert len(raw) == want, (short, len(raw), want)
++            pad = (-off) % 256
++            f.write(b"\0" * pad)
++            off += pad
++            f.write(raw)
++            lines.append(f"{short} {kind} {rows} {cols} {off} {len(raw)}")
++            off += len(raw)
++
++        def emit_q8(short: str, gguf_name: str, rows: int, cols: int):
++            """Q8_0 reused byte for byte (rows of cols//32 blocks)."""
++            raw = src_bytes(gguf_name)
++            n = rows * (cols // 32) * Q8_ROW
++            assert len(raw) == n, (gguf_name, len(raw), n)
++            emit(short, "q8_0", rows, cols, raw)
++
++        def emit_bf16_from_q8(short: str, gguf_name: str):
++            arr = np.frombuffer(src_bytes(gguf_name, "Q8_0"), dtype=np.uint8)
++            raw = bf16_bytes(arr, "Q8_0")
++            rows, cols = bf16_shape_of(gguf_name)
++            assert len(raw) == rows * cols * 2, (short, len(raw))
++            emit(short, "bf16", rows, cols, raw)
++
++        def emit_f32_norm(short: str, gguf_name: str, n: int):
++            arr = np.frombuffer(src_bytes(gguf_name, "F32"), dtype=np.float32).reshape(-1)
++            assert arr.size == n, (gguf_name, arr.size, n)
++            emit(short, "f32", 1, n, (arr + 1.0).astype(np.float32).tobytes())
++
++        # attention + shared expert + indexer (Q8_0 kept)
++        emit_q8("self_attn.q_proj.weight", "attn_q.weight", 12288, H)
++        emit_q8("self_attn.k_proj.weight", "attn_k.weight", 512, H)
++        emit_q8("self_attn.v_proj.weight", "attn_v.weight", 512, H)
++        emit_q8("self_attn.o_proj.weight", "attn_output.weight", H, 6144)
++        emit_q8("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight", FF, H)
++        emit_q8("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight", FF, H)
++        emit_q8("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight", H, FF)
++        # fused indexer qk: q rows ++ k rows (lossless concat, same row width)
++        q = src_bytes("indexer.q_proj.weight", "Q8_0")
++        k = src_bytes("indexer.k_proj.weight", "Q8_0")
++        assert len(q) == 512 * (H // 32) * Q8_ROW and len(k) == 128 * (H // 32) * Q8_ROW
++        emit("self_attn.indexer.index_qk_proj.weight", "q8_0", 640, H, q + k)
++        # eh_proj split along columns: [2560 rows x 160 blocks] -> 2 x [2560 x 80 blocks]
++        eh = src_bytes("nextn.eh_proj.weight", "Q8_0")
++        assert len(eh) == H * 160 * Q8_ROW, len(eh)
++        rows = np.frombuffer(eh, dtype=np.uint8).reshape(H, 160, Q8_ROW)
++        halves = (rows[:, 80:, :], rows[:, :80, :]) if a.swap_eh else (rows[:, :80, :], rows[:, 80:, :])
++        emit("fc_embedding.weight", "q8_0", H, H, halves[0].tobytes())
++        emit("fc_hidden.weight", "q8_0", H, H, halves[1].tobytes())
++        # hyper-connections + mixer (Q8_0 -> BF16) and router (F32 -> BF16)
++        for short, gguf_name in [
++                ("attn_hyper_connection.block_inject_weight.weight", "hc_attn_inject.weight"),
++                ("attn_hyper_connection.input_mix_weight_down.weight", "hc_attn_down.weight"),
++                ("attn_hyper_connection.input_mix_weight_up.weight", "hc_attn_up.weight"),
++                ("mlp_hyper_connection.block_inject_weight.weight", "hc_ffn_inject.weight"),
++                ("mlp_hyper_connection.input_mix_weight_down.weight", "hc_ffn_down.weight"),
++                ("mlp_hyper_connection.input_mix_weight_up.weight", "hc_ffn_up.weight"),
++                ("hyper_connection_mixer.input_mix_weight_down.weight", "nextn.hc_head_down.weight"),
++                ("hyper_connection_mixer.input_mix_weight_up.weight", "nextn.hc_head_up.weight")]:
++            emit_bf16_from_q8(short, gguf_name)
++        router = np.frombuffer(src_bytes("ffn_gate_inp.weight", "F32"), dtype=np.float32).reshape(512, H)
++        emit("mlp.gate.weight", "bf16", 512, H, bf16_bytes(router, "F32"))
++        emit("mlp.shared_expert_gate.weight", "bf16", 1, H, bf16_bytes(
++            np.frombuffer(src_bytes("ffn_gate_inp_shexp.weight", "F32"), dtype=np.float32), "F32"))
++        # norms (F32, Gemma +1)
++        for short, gguf_name, n in [
++                ("attn_hyper_connection.hc_norm.weight", "hc_attn_norm.weight", 10240),
++                ("mlp_hyper_connection.hc_norm.weight", "hc_ffn_norm.weight", 10240),
++                ("hyper_connection_mixer.hc_norm.weight", "nextn.hc_head_norm.weight", 10240),
++                ("self_attn.k_norm.weight", "attn_k_norm.weight", 256),
++                ("self_attn.q_norm.weight", "attn_q_norm.weight", 256),
++                ("self_attn.indexer.k_layernorm.weight", "indexer.k_norm.weight", 128),
++                ("self_attn.indexer.q_layernorm.weight", "indexer.q_norm.weight", 128),
++                ("pre_fc_norm_embedding.weight", "nextn.enorm.weight", H),
++                ("pre_fc_norm_hidden.weight", "nextn.hnorm.weight", 10240)]:
++            emit_f32_norm(short, gguf_name, n)
++    (out / "dense.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
++    (out / "mtp_from_gguf.report.json").write_text(json.dumps(
++        {"tool": "tools/mtp_from_gguf.py", "block": a.blk,
++         "swap_eh": a.swap_eh, "tensors": log}, indent=1) + "\n")
++    print(f"dense.bin {off} B, {len(lines)} tensors -> {out}")
++    for l in lines:
++        print("  " + l)
++    return 0
++
++
++def bf16_shape_of(gguf_name: str) -> tuple[int, int]:
++    # rows/cols of the BF16 image are asserted by the engine against dense.txt; shapes here mirror mtp_rt's table.
++    shapes = {
++        "hc_attn_inject.weight": (4, 10240), "hc_attn_down.weight": (320, 10240),
++        "hc_attn_up.weight": (10240, 320), "hc_ffn_inject.weight": (4, 10240),
++        "hc_ffn_down.weight": (320, 10240), "hc_ffn_up.weight": (10240, 320),
++        "nextn.hc_head_down.weight": (320, 10240), "nextn.hc_head_up.weight": (10240, 320),
++    }
++    return shapes[gguf_name]
++
++
++if __name__ == "__main__":
++    sys.exit(main())
